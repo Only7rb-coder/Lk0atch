@@ -40,7 +40,6 @@ def get_function_prologue(data, search_offset):
         pos = current_offset - i
         if pos < 0: continue
         # A simple heuristic: if the instruction is not a NOP and not a branch to self, it might be a start
-        # This is very weak, but better than nothing if specific prologues aren't found.
         instruction = data[pos:pos+4]
         if len(instruction) == 4 and instruction != b'\x1f\x20\x03\xd5': # Not a NOP
             return pos
@@ -62,18 +61,39 @@ def analyze(file_path, product_name):
         data = f.read()
     
     results = {}
-    # Prioritize sec_get_vfy_policy as it's the main target
-    targets = [
-        'sec_get_vfy_policy',
-        'get_sboot_state',
-        'get_lock_state',
-        'seccfg',
-        'boot_state',
-        'avb_slot_verify',
-        'sec_otp_ver_get'
-    ]
+    # Define specific replacements and descriptions based on the fenrir repository's devices.py
+    targets_info = {
+        'sec_get_vfy_policy': {
+            'description': 'Don\'t enforce secure boot policy',
+            'replacement': 'e0 03 1f 2a c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, WZR; RET + NOPs
+        },
+        'get_sboot_state': {
+            'description': 'Force secure boot state to enabled',
+            'replacement': '20 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #1; RET + NOPs
+        },
+        'get_lock_state': {
+            'description': 'Force bootloader lock state to unlocked',
+            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #0; RET + NOPs
+        },
+        'seccfg': {
+            'description': 'Bypass seccfg write protection',
+            'replacement': '1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # All NOPs for 32 bytes
+        },
+        'boot_state': {
+            'description': 'Force boot state to always be set to green',
+            'replacement': '28 03 00 b0 1f 49 02 b9 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5' # Specific replacement from plato commit
+        },
+        'avb_slot_verify': {
+            'description': 'Allow AVB verification errors',
+            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #0; RET + NOPs
+        },
+        'sec_otp_ver_get': {
+            'description': 'Bypass OTP verification',
+            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #0; RET + NOPs
+        }
+    }
     
-    for target in targets:
+    for target, info in targets_info.items():
         str_off = find_string(data, target)
         if str_off == -1:
             continue
@@ -81,41 +101,32 @@ def analyze(file_path, product_name):
         func_start = get_function_prologue(data, str_off)
         if func_start is not None:
             pattern = extract_pattern(data, func_start)
-            results[target] = pattern
+            results[target] = {
+                'pattern': pattern,
+                'replacement': info['replacement'],
+                'description': info['description']
+            }
         else:
             print(f"Warning: Could not find function prologue for {target} near string offset {hex(str_off)}.")
             
     if not results:
         print("Warning: No patterns found via string XREFs. Consider manual analysis.")
         
-    # Generate the Device config block
-    device_config = f"    Device(\n        '{product_name}',\n        '{product_name} Auto-Generated',\n        {{\n"
+    # Generate a simple codename from the product name
+    codename = product_name.lower().replace(' ', '_').replace('-', '_')
+
+    # Generate the Device config block with keyword arguments
+    device_config = f"    Device(\n        name='{product_name}',\n        codename='{codename}',\n        patches={{\n"
     
-    for name, pattern in results.items():
-        # MOV W0, #0; RET (8 bytes)
-        # Pad with NOPs to match pattern length (32 bytes = 8 instructions)
-        # NOP instruction: 1f 20 03 d5
-        replacement_hex = "00 00 80 52 c0 03 5f d6" # MOV W0, #0; RET
-        
-        # Calculate how many NOPs are needed
-        current_len_bytes = len(bytes.fromhex(replacement_hex.replace(' ', '')))
-        nops_needed_bytes = 32 - current_len_bytes
-        
-        if nops_needed_bytes < 0:
-            print(f"Error: Replacement for {name} is longer than pattern length. This should not happen with default values.")
-            replacement = replacement_hex # Use only the replacement without padding
-        else:
-            nop_padding = "1f 20 03 d5 " * (nops_needed_bytes // 4) # Each NOP is 4 bytes
-            replacement = (replacement_hex + " " + nop_padding).strip()
-            
+    for name, patch_data in results.items():
         device_config += f"            '{name}': PatchStage(\n"
-        device_config += f"                '{name}',\n"
-        device_config += f"                '{pattern}',\n"
-        device_config += f"                '{replacement}',\n"
-        device_config += f"                match_mode=MatchMode.ALL\n"
+        device_config += f"                name='{name}',\n"
+        device_config += f"                pattern='{patch_data['pattern']}',\n"
+        device_config += f"                replacement='{patch_data['replacement']}',\n"
+        device_config += f"                match_mode=MatchMode.ALL,\n"
+        device_config += f"                description='{patch_data['description']}',\n"
         device_config += f"            ),\n"
     
-    # If no patterns found, we still output the structure but it might be empty
     device_config += "        }\n    ),"
     
     print("--- GENERATED CONFIG ---")
