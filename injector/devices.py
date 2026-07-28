@@ -901,4 +901,24 @@ DEVICES = [
         },
         cert_bypass=CertBypass.WRAP
     ),
+    Device(
+        name=' Xiaomi Redmi Note 14 4G',
+        codename='_xiaomi_redmi_note_14_4g',
+        patches={
+            'get_lock_state': PatchStage(
+                name='get_lock_state',
+                pattern='67 65 74 5f 6c 6f 63 6b 5f 73 74 61 74 65 00 6e 6f 20 73 69 67 20 73 74 6f 72 65 64 0a 00 77 72',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Force bootloader lock state to unlocked',
+            ),
+            'seccfg': PatchStage(
+                name='seccfg',
+                pattern='73 65 63 63 66 67 00 2f 73 6f 63 2f 64 66 64 2d 6d 63 75 00 25 73 3a 20 53 65 74 75 70 20 64 66',
+                replacement='1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Bypass seccfg write protection',
+            ),
+        }
+    ),
 ]
