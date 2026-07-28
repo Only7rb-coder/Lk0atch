@@ -8,47 +8,42 @@ def find_string(data, s):
 
 def get_function_prologue(data, search_offset):
     # Search backwards from the string's location to find a common ARM64 function prologue.
-    # We'll look for common prologue patterns within a reasonable distance (e.g., 0x100 bytes).
-    # Common ARM64 prologues often involve saving registers (STP) or conditional branches (CBZ).
+    # We look for common prologue patterns within a reasonable distance (0x100 bytes).
     
     # Align search_offset to 4 bytes for instruction boundaries
     current_offset = search_offset & ~3
     
     # Search backwards for a function prologue signature
-    for i in range(0, min(current_offset, 0x100), 4): # Search up to 0x100 bytes back
+    for i in range(0, min(current_offset, 0x100), 4):
         pos = current_offset - i
-        if pos < 0: continue
+        if pos < 0:
+            continue
         
         instruction = data[pos:pos+4]
-        if len(instruction) < 4: continue
+        if len(instruction) < 4:
+            continue
         
         # STP X29, X30, [SP, #offset]!
-        # Common patterns: fd 7b be a9, fd 7b bf a9, fd 7b ba a9
         if instruction in [b'\xfd\x7b\xbe\xa9', b'\xfd\x7b\xbf\xa9', b'\xfd\x7b\xba\xa9']:
             return pos
         
-        # CBZ W0, #offset (often seen at the start of sec_get_vfy_policy)
-        # Instruction format: 0x34xxxxxx
-        # We check for the upper byte and lower 5 bits for CBZ W0
+        # CBZ W0, #offset
         if (struct.unpack('<I', instruction)[0] & 0xFF00001F) == 0x34000000:
-            # This is a CBZ W0 instruction. It's a strong candidate for a function start.
             return pos
             
-    # If no common prologue found, try to find the nearest instruction that looks like a function start
-    # This is a heuristic and might not always be accurate without full disassembly
-    for i in range(0, min(current_offset, 0x20), 4): # Search a smaller window for any instruction
+    # Fallback heuristic search window
+    for i in range(0, min(current_offset, 0x20), 4):
         pos = current_offset - i
-        if pos < 0: continue
-        # A simple heuristic: if the instruction is not a NOP and not a branch to self, it might be a start
+        if pos < 0:
+            continue
         instruction = data[pos:pos+4]
-        if len(instruction) == 4 and instruction != b'\x1f\x20\x03\xd5': # Not a NOP
+        if len(instruction) == 4 and instruction != b'\x1f\x20\x03\xd5':
             return pos
             
     return None
 
 def extract_pattern(data, offset, length=32):
     # Extract 32 bytes (8 instructions) for a unique pattern
-    # Ensure we don't read beyond the file length
     end_offset = min(offset + length, len(data))
     return data[offset:end_offset].hex(' ')
 
@@ -61,35 +56,36 @@ def analyze(file_path, product_name):
         data = f.read()
     
     results = {}
-    # Define specific replacements and descriptions based on the fenrir repository's devices.py
+    
+    # Patch replacements and descriptions matching the target repository specifications
     targets_info = {
         'sec_get_vfy_policy': {
             'description': 'Don\'t enforce secure boot policy',
-            'replacement': 'e0 03 1f 2a c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, WZR; RET + NOPs
+            'replacement': 'e0 03 1f 2a c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5'
         },
         'get_sboot_state': {
             'description': 'Force secure boot state to enabled',
-            'replacement': '20 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #1; RET + NOPs
+            'replacement': '20 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5'
         },
         'get_lock_state': {
             'description': 'Force bootloader lock state to unlocked',
-            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #0; RET + NOPs
+            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5'
         },
         'seccfg': {
             'description': 'Bypass seccfg write protection',
-            'replacement': '1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # All NOPs for 32 bytes
+            'replacement': '1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5'
         },
         'boot_state': {
             'description': 'Force boot state to always be set to green',
-            'replacement': '28 03 00 b0 1f 49 02 b9 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5' # Specific replacement from plato commit
+            'replacement': '28 03 00 b0 1f 49 02 b9 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5'
         },
         'avb_slot_verify': {
             'description': 'Allow AVB verification errors',
-            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #0; RET + NOPs
+            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5'
         },
         'sec_otp_ver_get': {
             'description': 'Bypass OTP verification',
-            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5' # MOV W0, #0; RET + NOPs
+            'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5'
         }
     }
     
@@ -110,12 +106,10 @@ def analyze(file_path, product_name):
             print(f"Warning: Could not find function prologue for {target} near string offset {hex(str_off)}.")
             
     if not results:
-        print("Warning: No patterns found via string XREFs. Consider manual analysis.")
+        print("Warning: No patterns found via string XREFs.")
         
-    # Generate a simple codename from the product name
     codename = product_name.lower().replace(' ', '_').replace('-', '_')
 
-    # Generate the Device config block with keyword arguments
     device_config = f"    Device(\n        name='{product_name}',\n        codename='{codename}',\n        patches={{\n"
     
     for name, patch_data in results.items():
