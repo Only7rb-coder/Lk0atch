@@ -901,4 +901,24 @@ DEVICES = [
         },
         cert_bypass=CertBypass.WRAP
     ),
+    Device(
+        name='redmi note 13 5g',
+        codename='redmi_note_13_5g',
+        patches={
+            'get_lock_state': PatchStage(
+                name='get_lock_state',
+                pattern='6d 69 5f 67 65 74 5f 6c 6f 63 6b 5f 73 74 61 74 65 00 00 00 6d 69 5f 63 68 65 63 6b 5f 6d 61 67',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Force bootloader lock state to unlocked',
+            ),
+            'seccfg': PatchStage(
+                name='seccfg',
+                pattern='73 65 63 63 66 67 00 00 77 72 69 74 65 20 70 72 6f 74 65 63 74 20 44 6f 6e 65 21 20 0a 00 00 00',
+                replacement='1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Bypass seccfg write protection',
+            ),
+        }
+    ),
 ]
