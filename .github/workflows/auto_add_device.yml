@@ -1,0 +1,86 @@
+name: Auto Add Device Support
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootloader_url:
+        description: 'Direct download URL for LK image (lk.img / .bin)'
+        required: true
+        type: string
+      product_name:
+        description: 'Product Name (e.g., Xiaomi 13, Nothing Phone 2a)'
+        required: true
+        type: string
+
+jobs:
+  analyze-and-add:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download LK Image
+        run: |
+          mkdir -p temp
+          curl -sSL -A "Mozilla/5.0" "${{ github.event.inputs.bootloader_url }}" -o temp/lk.bin
+          if [ ! -s temp/lk.bin ]; then
+            echo "::error::Failed to download LK image."
+            exit 1
+          fi
+
+      - name: Analyze LK and Generate Config
+        id: analyze
+        run: |
+          python3 .github/scripts/analyze_lk.py temp/lk.bin "${{ github.event.inputs.product_name }}" > temp/config.txt
+          cat temp/config.txt
+          
+          # Extract the config block
+          sed -n '/--- GENERATED CONFIG ---/,/--- END CONFIG ---/p' temp/config.txt | grep -v "---" > temp/device_entry.txt
+          
+          if [ ! -s temp/device_entry.txt ]; then
+            echo "::error::Analysis failed to generate patterns."
+            exit 1
+          fi
+
+      - name: Update devices.py
+        run: |
+          # Find the line where DEVICES = [ starts
+          # and append the new device after the opening bracket
+          # or before the closing bracket.
+          # A safer way is to insert before the last ] in the file.
+          
+          # We use a python script to safely append to the DEVICES list
+          python3 -c "
+          import sys
+          with open('injector/devices.py', 'r') as f:
+              content = f.read()
+          
+          with open('temp/device_entry.txt', 'r') as f:
+              new_device = f.read().strip()
+          
+          # Find the DEVICES = [ ... ] block
+          # We'll append it before the last ]
+          idx = content.rfind(']')
+          if idx != -1:
+              updated_content = content[:idx] + '    ' + new_device + '\n' + content[idx:]
+              with open('injector/devices.py', 'w') as f:
+                  f.write(updated_content)
+          else:
+              print('Could not find DEVICES list in devices.py')
+              sys.exit(1)
+          "
+
+      - name: Commit and Push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add injector/devices.py
+          git commit -m "feat: Add support for ${{ github.event.inputs.product_name }} (Auto-generated)"
+          git push
