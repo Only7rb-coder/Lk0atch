@@ -61,39 +61,40 @@ jobs:
           mkdir -p injector
           # If devices.py doesn't exist, create it with a basic structure
           if [ ! -f injector/devices.py ]; then
-            echo "from cert_bypass import CertBypass\nfrom device import Device\nfrom stage import PayloadStage, PatchStage\nfrom patch_utils import MatchMode\n\nDEVICES = [\n]\n" > injector/devices.py
+            printf "from cert_bypass import CertBypass\nfrom device import Device\nfrom stage import PayloadStage, PatchStage\nfrom patch_utils import MatchMode\n\nDEVICES = [\n]\n" > injector/devices.py
           fi
 
           python3 -c "
           import sys
-          
-          # Add the current directory to the Python path to import MatchMode
-          sys.path.insert(0, ".")
-          # Ensure patch_utils.py is available for MatchMode if it's used in devices.py
-          # This assumes patch_utils.py is in the same directory as devices.py or accessible via sys.path
+
+          # Add current directory and injector to Python search path safely
+          sys.path.insert(0, '.')
+          sys.path.insert(0, 'injector')
+
           try:
               from patch_utils import MatchMode
           except ImportError:
-              print("Warning: patch_utils.py not found. Ensure it's in the injector directory or accessible.")
-              # Define a dummy MatchMode if not found to prevent script from crashing
+              print('Warning: patch_utils.py not found. Ensure it\'s in the injector directory or accessible.')
               class MatchMode:
                   ALL = 'ALL'
                   FIRST = 'FIRST'
 
-          with open('injector/devices.py', 'r') as f: content = f.read()
-          with open('temp/device_entry.txt', 'r') as f: new_device = f.read().strip()
-          
-          # Find the DEVICES = [ ... ] block
-          # We'll append it before the last ]
+          with open('injector/devices.py', 'r') as f:
+              content = f.read()
+          with open('temp/device_entry.txt', 'r') as f:
+              new_device = f.read().strip()
+
+          # Find the DEVICES = [ ... ] list and inject before the closing bracket
           idx = content.rfind(']')
           if idx != -1:
-              # Insert the new device entry before the closing bracket, ensuring proper formatting
               updated_content = content[:idx] + '    ' + new_device + '\n]' + content[idx+1:]
-              with open('injector/devices.py', 'w') as f: f.write(updated_content)
+              with open('injector/devices.py', 'w') as f:
+                  f.write(updated_content)
           else:
-              print('Could not find DEVICES list in injector/devices.py. Please ensure the file has a DEVICES list.')
+              print('Could not find DEVICES list in injector/devices.py.')
               sys.exit(1)
           "
+
       - name: Commit and Push
         run: |
           git config --local user.email "action@github.com"
