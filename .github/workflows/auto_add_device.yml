@@ -28,10 +28,18 @@ jobs:
 
       - name: Download LK Image
         run: |
-          mkdir -p temp
+          mkdir -p temp .github/scripts
           curl -sSL -A "Mozilla/5.0" "${{ github.event.inputs.bootloader_url }}" -o temp/lk.bin
+          
+          # Check if download was successful and file is not empty
           if [ ! -s temp/lk.bin ]; then
-            echo "::error::Failed to download LK image."
+            echo "::error::Downloaded LK image is empty or failed to download. Please check the URL."
+            exit 1
+          fi
+          
+          # Check if the downloaded file is an HTML page (common error for bad direct links)
+          if head -c 256 temp/lk.bin | grep -qiE "<!DOCTYPE|<html|<head"; then
+            echo "::error::The provided URL returned an HTML page instead of a binary file. Please provide a DIRECT download link to the raw lk.img file."
             exit 1
           fi
 
@@ -40,47 +48,56 @@ jobs:
         run: |
           python3 .github/scripts/analyze_lk.py temp/lk.bin "${{ github.event.inputs.product_name }}" > temp/config.txt
           cat temp/config.txt
-          
-          # Extract the config block
           sed -n '/--- GENERATED CONFIG ---/,/--- END CONFIG ---/p' temp/config.txt | sed '/---/d' > temp/device_entry.txt
           
-          if [ ! -s temp/device_entry.txt ]; then
-            echo "::error::Analysis failed to generate patterns."
+          if [ ! -s temp/device_entry.txt ] || ! grep -q 'Device(' temp/device_entry.txt; then
+            echo "::error::Analysis failed to generate a valid device configuration. No patterns were found or the output was malformed."
             exit 1
           fi
 
       - name: Update devices.py
         run: |
-          # Find the line where DEVICES = [ starts
-          # and append the new device after the opening bracket
-          # or before the closing bracket.
-          # A safer way is to insert before the last ] in the file.
-          
-          # We use a python script to safely append to the DEVICES list
+          # Ensure the injector directory exists
+          mkdir -p injector
+          # If devices.py doesn't exist, create it with a basic structure
+          if [ ! -f injector/devices.py ]; then
+            echo "from cert_bypass import CertBypass\nfrom device import Device\nfrom stage import PayloadStage, PatchStage\nfrom patch_utils import MatchMode\n\nDEVICES = [\n]\n" > injector/devices.py
+          fi
+
           python3 -c "
           import sys
-          with open('injector/devices.py', 'r') as f:
-              content = f.read()
           
-          with open('temp/device_entry.txt', 'r') as f:
-              new_device = f.read().strip()
+          # Add the current directory to the Python path to import MatchMode
+          sys.path.insert(0, ".")
+          # Ensure patch_utils.py is available for MatchMode if it's used in devices.py
+          # This assumes patch_utils.py is in the same directory as devices.py or accessible via sys.path
+          try:
+              from patch_utils import MatchMode
+          except ImportError:
+              print("Warning: patch_utils.py not found. Ensure it's in the injector directory or accessible.")
+              # Define a dummy MatchMode if not found to prevent script from crashing
+              class MatchMode:
+                  ALL = 'ALL'
+                  FIRST = 'FIRST'
+
+          with open('injector/devices.py', 'r') as f: content = f.read()
+          with open('temp/device_entry.txt', 'r') as f: new_device = f.read().strip()
           
           # Find the DEVICES = [ ... ] block
           # We'll append it before the last ]
           idx = content.rfind(']')
           if idx != -1:
-              updated_content = content[:idx] + '    ' + new_device + '\n' + content[idx:]
-              with open('injector/devices.py', 'w') as f:
-                  f.write(updated_content)
+              # Insert the new device entry before the closing bracket, ensuring proper formatting
+              updated_content = content[:idx] + '    ' + new_device + '\n]' + content[idx+1:]
+              with open('injector/devices.py', 'w') as f: f.write(updated_content)
           else:
-              print('Could not find DEVICES list in devices.py')
+              print('Could not find DEVICES list in injector/devices.py. Please ensure the file has a DEVICES list.')
               sys.exit(1)
           "
-
-      - name: Commit and Push changes
+      - name: Commit and Push
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add injector/devices.py
-          git commit -m "feat: Add support for ${{ github.event.inputs.product_name }} (Auto-generated)"
+          git commit -m "feat: Add support for ${{ github.event.inputs.product_name }}"
           git push
