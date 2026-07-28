@@ -42,7 +42,7 @@ jobs:
           cat temp/config.txt
           
           # Extract the config block
-          sed -n '/--- GENERATED CONFIG ---/,/--- END CONFIG ---/p' temp/config.txt | grep -v "---" > temp/device_entry.txt
+          sed -n '/--- GENERATED CONFIG ---/,/--- END CONFIG ---/p' temp/config.txt | sed '/---/d' > temp/device_entry.txt
           
           if [ ! -s temp/device_entry.txt ]; then
             echo "::error::Analysis failed to generate patterns."
