@@ -23,17 +23,12 @@ on:
         options:
           - WRAP
           - OVERRIDE
-      base_address:
-        description: 'Optional: LK base address (leave empty for auto)'
-        required: false
-        type: string
 
 env:
   DEVICE_CODE: ${{ github.event.inputs.device_codename }}
   DEVICE_NAME: ${{ github.event.inputs.device_name }}
   LK_URL: ${{ github.event.inputs.lk_url }}
   CERT_BYPASS: ${{ github.event.inputs.cert_bypass }}
-  BASE_ADDR: ${{ github.event.inputs.base_address }}
 
 jobs:
   analyze-and-add:
@@ -56,8 +51,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install capstone requests
-          sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu
 
       - name: Download LK image
         run: |
@@ -65,9 +58,10 @@ jobs:
           curl -L -o "bin/${DEVICE_CODE}.bin" "${LK_URL}"
           ls -la "bin/${DEVICE_CODE}.bin"
           file "bin/${DEVICE_CODE}.bin"
-          echo "LK_SIZE=$(stat -c%s bin/${DEVICE_CODE}.bin)" >> $GITHUB_ENV
+          echo "=== First 64 bytes hex ==="
+          xxd -l 64 "bin/${DEVICE_CODE}.bin"
 
-      - name: Analyze LK binary and find patterns
+      - name: Deep analyze LK binary
         id: analyze
         run: |
           python3 << 'PYEOF'
@@ -77,117 +71,9 @@ jobs:
           CODE = open(f"bin/{os.environ['DEVICE_CODE']}.bin", 'rb').read()
           md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
 
-          # Known function signatures from existing devices
-          KNOWN_PATTERNS = {
-              'sec_get_vfy_policy': {
-                  'signatures': [
-                      b'\x20\x02\x00\xb4\xfd\x7b\xbe\xa9',  # CBZ + STP
-                      b'\x00\x01\x00\xb4\xfd\x7b\xbf\xa9',  # CBZ + STP (alt)
-                      b'\xe0\x01\x00\xb4\xfd\x7b\xbe\xa9',  # CBZ + STP (alt2)
-                      b'\x5f\x24\x03\xd5\x40\x01\x00\xb4',  # DSB + CBZ (newer)
-                  ],
-                  'replacement': '00 00 80 52 c0 03 5f d6',
-                  'desc': "Don't enforce secure boot policy",
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 12
-              },
-              'force_green_state': {
-                  'signatures': [
-                      b'\x00\x49\x02\xb9\xc0\x03\x5f\xd6',  # STR + RET pattern tail
-                      b'\x00\x21\x01\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\x29\x0d\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\xf1\x0a\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\xc1\x09\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\x91\x09\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\xa1\x04\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\xe1\x0c\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\xf9\x03\xb9\xc0\x03\x5f\xd6',
-                      b'\x00\x51\x08\xb9\xc0\x03\x5f\xd6',
-                  ],
-                  'replacement': None,  # Will be computed
-                  'desc': 'Force boot state to always be set to green',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 8,
-                  'is_green_state': True
-              },
-              'spoof_sboot_state': {
-                  'signatures': [
-                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa\x20\x00\x80\x52',
-                      b'\x3f\x23\x03\xd5\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa\x20\x00\x80\x52',
-                  ],
-                  'replacement': '48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
-                  'desc': 'Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 4
-              },
-              'spoof_lock_state': {
-                  'signatures': [
-                      b'\x20\x02\x00\xb4\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91',
-                      b'\x3f\x23\x03\xd5\xfd\x7b\xbe\xa9\xf4\x4f\x01\xa9\xfd\x03\x00\x91\xf3\x03\x00\xaa',
-                  ],
-                  'replacement': '88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
-                  'desc': 'Force lock state to always be LKS_LOCK',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 8
-              },
-              'dont_relock_seccfg': {
-                  'signatures': [
-                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\x2a\x28\x00\x80\x52',
-                  ],
-                  'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
-                  'desc': 'Prevent LK from relocking seccfg',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 4
-              },
-              'bypass_security_control': {
-                  'signatures': [
-                      b'\xe8\x0b\x40\xb9\x1f\x0d\x00\x71\x21\x01\x00\x54',
-                      b'\x88\x17\x40\xb9\xc8\x01\x00\x34',
-                      b'\x28\x17\x40\xb9\xc8\x01\x00\x34',
-                  ],
-                  'replacement': None,  # Will be computed
-                  'desc': 'Skip security error branch - always execute commands',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 0,
-                  'is_bypass': True
-              },
-              'bypass_cmd_erase_lock_control': {
-                  'signatures': [
-                      b'\xa8\x1f\x40\xb9\x1f\x05\x00\x71\x81\x00\x00\x54',
-                      b'\xe8\x0f\x40\xb9\x1f\x05\x00\x71\x81\x00\x00\x54',
-                  ],
-                  'replacement': None,
-                  'desc': 'Skip lock error branch - always execute erase',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 0,
-                  'is_bypass': True
-              },
-              'bypass_cmd_flash_control': {
-                  'signatures': [
-                      b'\xe8\x07\x40\xb9\x1f\x05\x00\x71\x21\x01\x00\x54',
-                      b'\xf6\x8f\x00\x94\x60\x01\x00\x34',
-                      b'\xf9\xc7\x01\x94\x80\x00\x00\x34',
-                  ],
-                  'replacement': None,
-                  'desc': 'Skip lock error branch - always execute flash',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 0,
-                  'is_bypass': True
-              },
-              'sec_otp_ver_get': {
-                  'signatures': [
-                      b'\xff\x43\x01\xd1\xfd\x7b\x01\xa9\xf8\x5f\x02\xa9\xf6\x57\x03\xa9\xf4\x4f\x04\xa9\xfd\x43\x00\x91\xf3\x03\x01\xaa\xbf\xc3\x1f\xb8\xc1\x02\x00\xb4',
-                  ],
-                  'replacement': 'e0 03 1f 2a c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
-                  'desc': 'Force otp verification to always return success',
-                  'match_mode': 'MatchMode.ALL',
-                  'extend': 0
-              },
-          }
+          print(f"LK size: {len(CODE)} bytes")
 
-          results = {}
-
-          def find_pattern(data, pattern):
+          def find_all(data, pattern):
               matches = []
               start = 0
               while True:
@@ -201,40 +87,203 @@ jobs:
           def bytes_to_hex(b):
               return ' '.join(f'{x:02x}' for x in b)
 
+          def disasm_at(data, offset, count=5):
+              """Disassemble instructions at given offset"""
+              end = min(offset + count * 4, len(data))
+              chunk = data[offset:end]
+              insns = []
+              for insn in md.disasm(chunk, offset):
+                  insns.append(f"{insn.address:08x}: {insn.mnemonic} {insn.op_str}")
+              return insns
+
+          def find_function_prologue(data, min_size=20):
+              """Find potential function starts by looking for common prologues"""
+              prologues = []
+              # STP X29, X30, [SP, #-X]!  - common function start
+              for i in range(0, len(data) - 4, 4):
+                  word = struct.unpack('<I', data[i:i+4])[0]
+                  # STP X29, X30, [SP, #imm]!  -> 0xA9xx7BFD
+                  if (word & 0xFF000000) == 0xA9000000 and (word & 0x00FFFFFF) == 0x007BBF:
+                      prologues.append(i)
+                  # STP X29, X30, [SP, #-imm]! -> 0xA9xx7BBF  
+                  elif (word & 0xFF000000) == 0xA9000000 and (word & 0x00FFFFFF) == 0x007BBE:
+                      prologues.append(i)
+              return prologues
+
+          def fuzzy_find(data, pattern, max_mismatch=2):
+              """Find pattern allowing up to max_mismatch byte differences"""
+              matches = []
+              for i in range(len(data) - len(pattern) + 1):
+                  mismatches = sum(a != b for a, b in zip(pattern, data[i:i+len(pattern)]))
+                  if mismatches <= max_mismatch:
+                      matches.append((i, mismatches))
+              return matches
+
+          def find_str_b_imm(data, target_reg=0, max_offset=0x1000):
+              """Find STR instructions storing to [Xn, #imm] where target is WZR"""
+              matches = []
+              for i in range(0, len(data) - 4, 4):
+                  word = struct.unpack('<I', data[i:i+4])[0]
+                  # STR (immediate) with WZR: 0xb900001f -> str wzr, [xn, #0]
+                  # General form: 1x 00 1000 11 imm12 Rn Rt
+                  if (word & 0xFFC00000) == 0xB9000000 and (word & 0x1F) == 0x1F:
+                      matches.append(i)
+              return matches
+
+          def find_cbz_cbnz(data):
+              """Find CBZ/CBNZ instructions at function starts"""
+              matches = []
+              for i in range(0, len(data) - 4, 4):
+                  word = struct.unpack('<I', data[i:i+4])[0]
+                  # CBZ/CBNZ: 0xB4xxxxxx or 0xB5xxxxxx
+                  if (word & 0xFE000000) == 0xB4000000:
+                      matches.append(i)
+              return matches
+
+          def find_ret_sequences(data):
+              """Find RET instructions"""
+              matches = []
+              for i in range(0, len(data) - 4, 4):
+                  word = struct.unpack('<I', data[i:i+4])[0]
+                  # RET: 0xD65F03C0
+                  if word == 0xD65F03C0:
+                      matches.append(i)
+              return matches
+
+          def find_ldr_b_check(data):
+              """Find LDR followed by CMP/CBZ patterns (security checks)"""
+              matches = []
+              for i in range(0, len(data) - 12, 4):
+                  w0 = struct.unpack('<I', data[i:i+4])[0]
+                  w1 = struct.unpack('<I', data[i+4:i+8])[0]
+                  w2 = struct.unpack('<I', data[i+8:i+12])[0]
+                  # LDR Wn, [Xm, #imm] -> 0xB9xxxxxx
+                  # CMP Wn, #imm -> 0x7100001F or similar
+                  # B.cond -> 0x54xxxxxx
+                  if (w0 & 0xFFC00000) == 0xB9400000:
+                      if (w1 & 0xFF00001F) == 0x7100001F or (w1 & 0xFF000000) == 0x71000000:
+                          if (w2 & 0xFF000000) == 0x54000000:
+                              matches.append(i)
+              return matches
+
+          # ===== STRATEGY 1: Search for specific byte sequences with fuzzy matching =====
+          print("\n=== FUZZY PATTERN SEARCH ===")
+
+          FUZZY_SIGNATURES = {
+              'sec_get_vfy_policy': {
+                  'patterns': [
+                      b'\x20\x02\x00\xb4\xfd\x7b\xbe\xa9',  # CBZ + STP
+                      b'\x00\x01\x00\xb4\xfd\x7b\xbf\xa9',  # alt
+                      b'\xe0\x01\x00\xb4\xfd\x7b\xbe\xa9',  # alt2
+                      b'\x5f\x24\x03\xd5\x40\x01\x00\xb4',  # DSB + CBZ
+                      b'\x20\x02\x00\xb4\xfd\x7b\xbf\xa9',  # another variant
+                  ],
+                  'replacement': '00 00 80 52 c0 03 5f d6',
+                  'desc': "Don't enforce secure boot policy",
+                  'extend': 12
+              },
+              'spoof_sboot_state': {
+                  'patterns': [
+                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa\x20\x00\x80\x52',
+                      b'\x3f\x23\x03\xd5\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa\x20\x00\x80\x52',
+                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa',
+                  ],
+                  'replacement': '48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                  'desc': 'Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+                  'extend': 4
+              },
+              'spoof_lock_state': {
+                  'patterns': [
+                      b'\x20\x02\x00\xb4\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91',
+                      b'\x3f\x23\x03\xd5\xfd\x7b\xbe\xa9\xf4\x4f\x01\xa9\xfd\x03\x00\x91\xf3\x03\x00\xaa',
+                      b'\x20\x02\x00\xb4\xfd\x7b\xbf\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91',
+                  ],
+                  'replacement': '88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                  'desc': 'Force lock state to always be LKS_LOCK',
+                  'extend': 8
+              },
+              'dont_relock_seccfg': {
+                  'patterns': [
+                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\x2a\x28\x00\x80\x52',
+                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\x2a',
+                  ],
+                  'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                  'desc': 'Prevent LK from relocking seccfg',
+                  'extend': 4
+              },
+              'bypass_security_control': {
+                  'patterns': [
+                      b'\xe8\x0b\x40\xb9\x1f\x0d\x00\x71\x21\x01\x00\x54',
+                      b'\x88\x17\x40\xb9\xc8\x01\x00\x34',
+                      b'\x28\x17\x40\xb9\xc8\x01\x00\x34',
+                      b'\x88\x17\x40\xb9\x08\x02\x00\x34',
+                  ],
+                  'replacement': None,  # computed
+                  'desc': 'Skip security error branch - always execute commands',
+                  'extend': 0,
+                  'is_bypass': True
+              },
+              'bypass_cmd_erase_lock_control': {
+                  'patterns': [
+                      b'\xa8\x1f\x40\xb9\x1f\x05\x00\x71\x81\x00\x00\x54',
+                      b'\xe8\x0f\x40\xb9\x1f\x05\x00\x71\x81\x00\x00\x54',
+                      b'\xe8\x0f\x40\xb9\x1f\x05\x00\x71',
+                  ],
+                  'replacement': None,
+                  'desc': 'Skip lock error branch - always execute erase',
+                  'extend': 0,
+                  'is_bypass': True
+              },
+              'bypass_cmd_flash_control': {
+                  'patterns': [
+                      b'\xe8\x07\x40\xb9\x1f\x05\x00\x71\x21\x01\x00\x54',
+                      b'\xf6\x8f\x00\x94\x60\x01\x00\x34',
+                      b'\xf9\xc7\x01\x94\x80\x00\x00\x34',
+                  ],
+                  'replacement': None,
+                  'desc': 'Skip lock error branch - always execute flash',
+                  'extend': 0,
+                  'is_bypass': True
+              },
+              'sec_otp_ver_get': {
+                  'patterns': [
+                      b'\xff\x43\x01\xd1\xfd\x7b\x01\xa9\xf8\x5f\x02\xa9\xf6\x57\x03\xa9\xf4\x4f\x04\xa9\xfd\x43\x00\x91\xf3\x03\x01\xaa\xbf\xc3\x1f\xb8\xc1\x02\x00\xb4',
+                      b'\xff\x43\x01\xd1\xfd\x7b\x01\xa9',
+                  ],
+                  'replacement': 'e0 03 1f 2a c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                  'desc': 'Force otp verification to always return success',
+                  'extend': 0
+              },
+          }
+
+          results = {}
+
           def pad_replacement(repl_hex, target_len):
               repl_bytes = bytes.fromhex(repl_hex.replace(' ', ''))
               if len(repl_bytes) >= target_len:
                   return bytes_to_hex(repl_bytes[:target_len])
-              # Pad with NOPs
               nop = b'\x1f\x20\x03\xd5'
               needed = target_len - len(repl_bytes)
               repl_bytes += nop * (needed // 4 + 1)
               return bytes_to_hex(repl_bytes[:target_len])
 
-          for func_name, info in KNOWN_PATTERNS.items():
+          for func_name, info in FUZZY_SIGNATURES.items():
               found = False
-              for sig in info['signatures']:
-                  matches = find_pattern(CODE, sig)
-                  if matches:
-                      for match_off in matches[:1]:
-                          extend = info.get('extend', 0)
-                          start = max(0, match_off - 8)
-                          end = match_off + len(sig) + extend
-                          pattern_bytes = CODE[start:end]
-                          pattern_hex = bytes_to_hex(pattern_bytes)
+              best_match = None
+              best_score = float('inf')
 
-                          if info.get('is_green_state'):
-                              # Replace store with STR WZR
+              for sig in info['patterns']:
+                  # Try exact match first
+                  matches = find_all(CODE, sig)
+                  if matches:
+                      for m in matches[:1]:
+                          extend = info.get('extend', 0)
+                          start = max(0, m - 8)
+                          end = m + len(sig) + extend
+                          pattern_bytes = CODE[start:end]
+
+                          if info.get('is_bypass'):
                               repl_bytes = bytearray(pattern_bytes)
-                              for i in range(len(repl_bytes) - 3):
-                                  if repl_bytes[i+3] == 0xb9 and repl_bytes[i] == 0x00:
-                                      repl_bytes[i] = 0x1f  # WZR
-                              repl = bytes_to_hex(bytes(repl_bytes))
-                          elif info.get('is_bypass'):
-                              # Replace conditional branch with NOP
-                              repl_bytes = bytearray(pattern_bytes)
-                              # Find the conditional branch (CBZ, CBNZ, B.cond) at the end
-                              # Replace last 4 bytes with NOP
                               if len(repl_bytes) >= 4:
                                   repl_bytes[-4:] = b'\x1f\x20\x03\xd5'
                               repl = bytes_to_hex(bytes(repl_bytes))
@@ -244,21 +293,123 @@ jobs:
                           repl = pad_replacement(repl, len(pattern_bytes))
 
                           results[func_name] = {
-                              'pattern': pattern_hex,
+                              'pattern': bytes_to_hex(pattern_bytes),
                               'replacement': repl,
-                              'match_mode': info['match_mode'],
+                              'match_mode': 'MatchMode.ALL',
                               'description': info['desc'],
                               'offset': hex(start),
                               'matches': len(matches)
                           }
                           found = True
                           break
+
+                  if not found:
+                      # Try fuzzy match
+                      fuzzy = fuzzy_find(CODE, sig, max_mismatch=3)
+                      if fuzzy:
+                          for m, mismatches in fuzzy[:1]:
+                              if mismatches < best_score:
+                                  best_score = mismatches
+                                  best_match = (m, mismatches, sig)
+
                   if found:
                       break
+
+              if not found and best_match:
+                  m, mismatches, sig = best_match
+                  extend = info.get('extend', 0)
+                  start = max(0, m - 8)
+                  end = m + len(sig) + extend
+                  pattern_bytes = CODE[start:end]
+
+                  if info.get('is_bypass'):
+                      repl_bytes = bytearray(pattern_bytes)
+                      if len(repl_bytes) >= 4:
+                          repl_bytes[-4:] = b'\x1f\x20\x03\xd5'
+                      repl = bytes_to_hex(bytes(repl_bytes))
+                  else:
+                      repl = info['replacement']
+
+                  repl = pad_replacement(repl, len(pattern_bytes))
+
+                  results[func_name] = {
+                      'pattern': bytes_to_hex(pattern_bytes),
+                      'replacement': repl,
+                      'match_mode': 'MatchMode.ALL',
+                      'description': info['desc'] + f' (fuzzy, {mismatches} mismatches)',
+                      'offset': hex(start),
+                      'matches': len(fuzzy),
+                      'fuzzy': True
+                  }
+                  found = True
+
               if not found:
                   results[func_name] = {'error': 'Pattern not found'}
 
-          print("=== ANALYSIS RESULTS ===")
+          # ===== STRATEGY 2: Heuristic search for force_green_state =====
+          if 'force_green_state' not in results or 'error' in results.get('force_green_state', {}):
+              print("\n=== HEURISTIC: Searching for force_green_state ===")
+              # Look for STR + RET patterns where we can change the store to STR WZR
+              str_wzr = find_str_b_imm(CODE)
+              print(f"Found {len(str_wzr)} STR WZR candidates")
+
+              # Also look for STR W0 followed by RET
+              for i in range(0, len(CODE) - 8, 4):
+                  w0 = struct.unpack('<I', CODE[i:i+4])[0]
+                  w1 = struct.unpack('<I', CODE[i+4:i+8])[0]
+                  # STR W0, [Xn, #imm] followed by RET
+                  if (w0 & 0xFFC00000) == 0xB9000000 and (w0 & 0x1F) == 0x00 and w1 == 0xD65F03C0:
+                      # Check if preceded by ADRP/ADRL
+                      start = max(0, i - 12)
+                      pattern_bytes = CODE[start:i+8]
+                      # Replace STR W0 with STR WZR
+                      repl_bytes = bytearray(pattern_bytes)
+                      for j in range(len(repl_bytes) - 3):
+                          if (repl_bytes[j+3] & 0xFC) == 0xB8 and repl_bytes[j] == 0x00:
+                              repl_bytes[j] = 0x1f
+
+                      results['force_green_state'] = {
+                          'pattern': bytes_to_hex(pattern_bytes),
+                          'replacement': bytes_to_hex(bytes(repl_bytes)),
+                          'match_mode': 'MatchMode.ALL',
+                          'description': 'Force boot state to always be set to green (heuristic)',
+                          'offset': hex(start),
+                          'matches': 1,
+                          'heuristic': True
+                      }
+                      print(f"Found force_green_state at {hex(start)}")
+                      break
+
+          # ===== STRATEGY 3: Search by function prologue analysis =====
+          print("\n=== PROLOGUE ANALYSIS ===")
+          prologues = find_function_prologue(CODE)
+          print(f"Found {len(prologues)} potential function prologues")
+
+          # Try to find sec_get_vfy_policy by looking for CBZ followed by prologue
+          if 'sec_get_vfy_policy' not in results or 'error' in results.get('sec_get_vfy_policy', {}):
+              cbz_s = find_cbz_cbnz(CODE)
+              for cbz_off in cbz_s[:50]:  # Check first 50 CBZ
+                  # Check if next instruction is a prologue
+                  next_off = cbz_off + 4
+                  if next_off in prologues:
+                      # This looks like sec_get_vfy_policy!
+                      start = cbz_off
+                      end = min(cbz_off + 20, len(CODE))
+                      pattern_bytes = CODE[start:end]
+
+                      results['sec_get_vfy_policy'] = {
+                          'pattern': bytes_to_hex(pattern_bytes),
+                          'replacement': pad_replacement('00 00 80 52 c0 03 5f d6', len(pattern_bytes)),
+                          'match_mode': 'MatchMode.ALL',
+                          'description': "Don't enforce secure boot policy (prologue heuristic)",
+                          'offset': hex(start),
+                          'matches': 1,
+                          'heuristic': True
+                      }
+                      print(f"Found sec_get_vfy_policy at {hex(start)} via prologue analysis")
+                      break
+
+          print("\n=== FINAL RESULTS ===")
           print(json.dumps(results, indent=2))
 
           with open('/tmp/analysis_results.json', 'w') as f:
@@ -318,7 +469,7 @@ jobs:
       - name: Insert device into devices.py
         run: |
           python3 << 'PYEOF'
-          import os, re
+          import os
 
           with open('/tmp/device_entry.py') as f:
               entry = f.read()
@@ -326,8 +477,6 @@ jobs:
           with open('injector/devices.py', 'r') as f:
               content = f.read()
 
-          # Find the last occurrence of ),\n] and insert before it
-          # Use regex to find the final closing bracket
           last_bracket = content.rfind(']')
           if last_bracket != -1:
               new_content = content[:last_bracket] + '\n' + entry + '\n' + content[last_bracket:]
