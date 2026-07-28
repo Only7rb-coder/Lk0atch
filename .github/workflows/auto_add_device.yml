@@ -1,171 +1,349 @@
-name: Auto Add Device Support
+name: Auto-Add Device to fenrir
 
 on:
   workflow_dispatch:
     inputs:
-      bootloader_url:
-        description: 'Direct download URL for LK image (lk.img / .bin)'
+      device_codename:
+        description: 'Device codename (e.g., gold)'
         required: true
         type: string
-      product_name:
-        description: 'Product Name (e.g., Xiaomi 13, Nothing Phone 2a)'
+      device_name:
+        description: 'Device display name (e.g., Redmi Note 13 5G)'
         required: true
         type: string
+      lk_url:
+        description: 'Direct download URL for lk.img (raw binary)'
+        required: true
+        type: string
+      cert_bypass:
+        description: 'CertBypass mode'
+        required: true
+        default: 'WRAP'
+        type: choice
+        options:
+          - WRAP
+          - OVERRIDE
+      base_address:
+        description: 'Optional: LK base address (leave empty for auto)'
+        required: false
+        type: string
+
+env:
+  DEVICE_CODE: ${{ github.event.inputs.device_codename }}
+  DEVICE_NAME: ${{ github.event.inputs.device_name }}
+  LK_URL: ${{ github.event.inputs.lk_url }}
+  CERT_BYPASS: ${{ github.event.inputs.cert_bypass }}
+  BASE_ADDR: ${{ github.event.inputs.base_address }}
 
 jobs:
   analyze-and-add:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Download LK Image
+      - name: Install dependencies
         run: |
-          mkdir -p temp bin .github/scripts
-          curl -sSL -A "Mozilla/5.0" "${{ github.event.inputs.bootloader_url }}" -o temp/lk.bin
-          
-          # Check if download was successful and file is not empty
-          if [ ! -s temp/lk.bin ]; then
-            echo "::error::Downloaded LK image is empty or failed to download. Please check the URL."
-            exit 1
-          fi
-          
-          # Check if the downloaded file is an HTML page (common error for bad direct links)
-          if head -c 256 temp/lk.bin | grep -qiE "<!DOCTYPE|<html|<head"; then
-            echo "::error::The provided URL returned an HTML page instead of a binary file. Please provide a DIRECT download link to the raw lk.img file."
-            exit 1
-          fi
+          python -m pip install --upgrade pip
+          pip install capstone requests
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
 
-      - name: Analyze LK and Generate Config
+      - name: Download LK image
+        run: |
+          mkdir -p bin
+          curl -L -o "bin/${DEVICE_CODE}.bin" "${LK_URL}"
+          ls -la "bin/${DEVICE_CODE}.bin"
+          file "bin/${DEVICE_CODE}.bin"
+          echo "LK_SIZE=$(stat -c%s bin/${DEVICE_CODE}.bin)" >> $GITHUB_ENV
+
+      - name: Analyze LK binary and find patterns
         id: analyze
         run: |
-          python3 .github/scripts/analyze_lk.py temp/lk.bin "${{ github.event.inputs.product_name }}" > temp/config.txt
-          cat temp/config.txt
-          sed -n '/--- GENERATED CONFIG ---/,/--- END CONFIG ---/p' temp/config.txt | sed '/---/d' > temp/device_entry.txt
-          
-          if [ ! -s temp/device_entry.txt ] || ! grep -q 'Device(' temp/device_entry.txt; then
-            echo "::error::Analysis failed to generate a valid device configuration. No patterns were found or the output was malformed."
-            exit 1
-          fi
+          python3 << 'PYEOF'
+          import struct, sys, re, json, os
+          from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
 
-      - name: Update devices.py
+          CODE = open(f"bin/{os.environ['DEVICE_CODE']}.bin", 'rb').read()
+          md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+
+          # Known function signatures from existing devices
+          KNOWN_PATTERNS = {
+              'sec_get_vfy_policy': {
+                  'signatures': [
+                      b'\x20\x02\x00\xb4\xfd\x7b\xbe\xa9',  # CBZ + STP
+                      b'\x00\x01\x00\xb4\xfd\x7b\xbf\xa9',  # CBZ + STP (alt)
+                      b'\xe0\x01\x00\xb4\xfd\x7b\xbe\xa9',  # CBZ + STP (alt2)
+                      b'\x5f\x24\x03\xd5\x40\x01\x00\xb4',  # DSB + CBZ (newer)
+                  ],
+                  'replacement': '00 00 80 52 c0 03 5f d6',
+                  'desc': "Don't enforce secure boot policy",
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 12
+              },
+              'force_green_state': {
+                  'signatures': [
+                      b'\x00\x49\x02\xb9\xc0\x03\x5f\xd6',  # STR + RET pattern tail
+                      b'\x00\x21\x01\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\x29\x0d\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\xf1\x0a\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\xc1\x09\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\x91\x09\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\xa1\x04\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\xe1\x0c\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\xf9\x03\xb9\xc0\x03\x5f\xd6',
+                      b'\x00\x51\x08\xb9\xc0\x03\x5f\xd6',
+                  ],
+                  'replacement': None,  # Will be computed
+                  'desc': 'Force boot state to always be set to green',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 8,
+                  'is_green_state': True
+              },
+              'spoof_sboot_state': {
+                  'signatures': [
+                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa\x20\x00\x80\x52',
+                      b'\x3f\x23\x03\xd5\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\xaa\x20\x00\x80\x52',
+                  ],
+                  'replacement': '48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                  'desc': 'Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 4
+              },
+              'spoof_lock_state': {
+                  'signatures': [
+                      b'\x20\x02\x00\xb4\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91',
+                      b'\x3f\x23\x03\xd5\xfd\x7b\xbe\xa9\xf4\x4f\x01\xa9\xfd\x03\x00\x91\xf3\x03\x00\xaa',
+                  ],
+                  'replacement': '88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                  'desc': 'Force lock state to always be LKS_LOCK',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 8
+              },
+              'dont_relock_seccfg': {
+                  'signatures': [
+                      b'\xfd\x7b\xbe\xa9\xf3\x0b\x00\xf9\xfd\x03\x00\x91\xf3\x03\x00\x2a\x28\x00\x80\x52',
+                  ],
+                  'replacement': '00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                  'desc': 'Prevent LK from relocking seccfg',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 4
+              },
+              'bypass_security_control': {
+                  'signatures': [
+                      b'\xe8\x0b\x40\xb9\x1f\x0d\x00\x71\x21\x01\x00\x54',
+                      b'\x88\x17\x40\xb9\xc8\x01\x00\x34',
+                      b'\x28\x17\x40\xb9\xc8\x01\x00\x34',
+                  ],
+                  'replacement': None,  # Will be computed
+                  'desc': 'Skip security error branch - always execute commands',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 0,
+                  'is_bypass': True
+              },
+              'bypass_cmd_erase_lock_control': {
+                  'signatures': [
+                      b'\xa8\x1f\x40\xb9\x1f\x05\x00\x71\x81\x00\x00\x54',
+                      b'\xe8\x0f\x40\xb9\x1f\x05\x00\x71\x81\x00\x00\x54',
+                  ],
+                  'replacement': None,
+                  'desc': 'Skip lock error branch - always execute erase',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 0,
+                  'is_bypass': True
+              },
+              'bypass_cmd_flash_control': {
+                  'signatures': [
+                      b'\xe8\x07\x40\xb9\x1f\x05\x00\x71\x21\x01\x00\x54',
+                      b'\xf6\x8f\x00\x94\x60\x01\x00\x34',
+                      b'\xf9\xc7\x01\x94\x80\x00\x00\x34',
+                  ],
+                  'replacement': None,
+                  'desc': 'Skip lock error branch - always execute flash',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 0,
+                  'is_bypass': True
+              },
+              'sec_otp_ver_get': {
+                  'signatures': [
+                      b'\xff\x43\x01\xd1\xfd\x7b\x01\xa9\xf8\x5f\x02\xa9\xf6\x57\x03\xa9\xf4\x4f\x04\xa9\xfd\x43\x00\x91\xf3\x03\x01\xaa\xbf\xc3\x1f\xb8\xc1\x02\x00\xb4',
+                  ],
+                  'replacement': 'e0 03 1f 2a c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                  'desc': 'Force otp verification to always return success',
+                  'match_mode': 'MatchMode.ALL',
+                  'extend': 0
+              },
+          }
+
+          results = {}
+
+          def find_pattern(data, pattern):
+              matches = []
+              start = 0
+              while True:
+                  idx = data.find(pattern, start)
+                  if idx == -1:
+                      break
+                  matches.append(idx)
+                  start = idx + 1
+              return matches
+
+          def bytes_to_hex(b):
+              return ' '.join(f'{x:02x}' for x in b)
+
+          def pad_replacement(repl_hex, target_len):
+              repl_bytes = bytes.fromhex(repl_hex.replace(' ', ''))
+              if len(repl_bytes) >= target_len:
+                  return bytes_to_hex(repl_bytes[:target_len])
+              # Pad with NOPs
+              nop = b'\x1f\x20\x03\xd5'
+              needed = target_len - len(repl_bytes)
+              repl_bytes += nop * (needed // 4 + 1)
+              return bytes_to_hex(repl_bytes[:target_len])
+
+          for func_name, info in KNOWN_PATTERNS.items():
+              found = False
+              for sig in info['signatures']:
+                  matches = find_pattern(CODE, sig)
+                  if matches:
+                      for match_off in matches[:1]:
+                          extend = info.get('extend', 0)
+                          start = max(0, match_off - 8)
+                          end = match_off + len(sig) + extend
+                          pattern_bytes = CODE[start:end]
+                          pattern_hex = bytes_to_hex(pattern_bytes)
+
+                          if info.get('is_green_state'):
+                              # Replace store with STR WZR
+                              repl_bytes = bytearray(pattern_bytes)
+                              for i in range(len(repl_bytes) - 3):
+                                  if repl_bytes[i+3] == 0xb9 and repl_bytes[i] == 0x00:
+                                      repl_bytes[i] = 0x1f  # WZR
+                              repl = bytes_to_hex(bytes(repl_bytes))
+                          elif info.get('is_bypass'):
+                              # Replace conditional branch with NOP
+                              repl_bytes = bytearray(pattern_bytes)
+                              # Find the conditional branch (CBZ, CBNZ, B.cond) at the end
+                              # Replace last 4 bytes with NOP
+                              if len(repl_bytes) >= 4:
+                                  repl_bytes[-4:] = b'\x1f\x20\x03\xd5'
+                              repl = bytes_to_hex(bytes(repl_bytes))
+                          else:
+                              repl = info['replacement']
+
+                          repl = pad_replacement(repl, len(pattern_bytes))
+
+                          results[func_name] = {
+                              'pattern': pattern_hex,
+                              'replacement': repl,
+                              'match_mode': info['match_mode'],
+                              'description': info['desc'],
+                              'offset': hex(start),
+                              'matches': len(matches)
+                          }
+                          found = True
+                          break
+                  if found:
+                      break
+              if not found:
+                  results[func_name] = {'error': 'Pattern not found'}
+
+          print("=== ANALYSIS RESULTS ===")
+          print(json.dumps(results, indent=2))
+
+          with open('/tmp/analysis_results.json', 'w') as f:
+              json.dump(results, f)
+
+          found_count = sum(1 for v in results.values() if 'error' not in v)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"found_count={found_count}\n")
+          PYEOF
+
+      - name: Generate device entry
+        id: generate
         run: |
-          # Ensure the injector directory exists
-          mkdir -p injector
-          # If devices.py doesn't exist, create it with a basic structure
-          if [ ! -f injector/devices.py ]; then
-            printf "from cert_bypass import CertBypass\nfrom device import Device\nfrom stage import PayloadStage, PatchStage\nfrom patch_utils import MatchMode\n\nDEVICES = [\n]\n" > injector/devices.py
-          fi
+          python3 << 'PYEOF'
+          import json, os
 
-          python3 -c "
-          import sys
+          with open('/tmp/analysis_results.json') as f:
+              results = json.load(f)
 
-          # Add current directory and injector to Python search path safely
-          sys.path.insert(0, '.')
-          sys.path.insert(0, 'injector')
+          codename = os.environ['DEVICE_CODE']
+          devname = os.environ['DEVICE_NAME']
+          cert = os.environ['CERT_BYPASS']
 
-          try:
-              from patch_utils import MatchMode
-          except ImportError:
-              print('Warning: patch_utils.py not found. Ensure it\'s in the injector directory or accessible.')
-              class MatchMode:
-                  ALL = 'ALL'
-                  FIRST = 'FIRST'
+          lines = []
+          lines.append("Device(")
+          lines.append(f"    '{codename}',")
+          lines.append(f"    '{devname}',")
+          lines.append("    {")
+
+          for func_name, info in results.items():
+              if 'error' in info:
+                  lines.append(f"        # {func_name}: NOT FOUND - {info['error']}")
+                  continue
+              lines.append(f"        '{func_name}': PatchStage(")
+              lines.append(f"            '{func_name}',")
+              lines.append(f"            pattern='{info['pattern']}',")
+              lines.append(f"            replacement='{info['replacement']}',")
+              lines.append(f"            match_mode={info['match_mode']},")
+              lines.append(f"            description='{info['description']}',")
+              lines.append("        ),")
+
+          lines.append("    },")
+          lines.append(f"    cert_bypass=CertBypass.{cert}")
+          lines.append("),")
+
+          entry = '\n'.join(lines)
+          print("=== GENERATED DEVICE ENTRY ===")
+          print(entry)
+
+          with open('/tmp/device_entry.py', 'w') as f:
+              f.write(entry)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"entry<<EOF\n{entry}\nEOF\n")
+          PYEOF
+
+      - name: Insert device into devices.py
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+
+          with open('/tmp/device_entry.py') as f:
+              entry = f.read()
 
           with open('injector/devices.py', 'r') as f:
               content = f.read()
-          with open('temp/device_entry.txt', 'r') as f:
-              new_device = f.read().strip()
 
-          # Find the DEVICES = [ ... ] list and inject before the closing bracket
-          idx = content.rfind(']')
-          if idx != -1:
-              updated_content = content[:idx] + '    ' + new_device + '\n' + content[idx:]
+          # Find the last occurrence of ),\n] and insert before it
+          # Use regex to find the final closing bracket
+          last_bracket = content.rfind(']')
+          if last_bracket != -1:
+              new_content = content[:last_bracket] + '\n' + entry + '\n' + content[last_bracket:]
               with open('injector/devices.py', 'w') as f:
-                  f.write(updated_content)
+                  f.write(new_content)
+              print("Device entry inserted successfully!")
           else:
-              print('Could not find DEVICES list in injector/devices.py.')
-              sys.exit(1)
-          "
+              print("ERROR: Could not find insertion point")
+              exit(1)
+          PYEOF
 
-      - name: Copy binary to bin directory
+      - name: Commit and push changes
         run: |
-          # FIX: Copy the downloaded LK binary to bin/ directory with proper codename
-          CODENAME=$(echo "${{ github.event.inputs.product_name }}" | tr '[:upper:]' '[:lower:]' | tr ' -' '__' | tr -d "'." | tr -s '_')
-          cp temp/lk.bin "bin/${CODENAME}.bin"
-          echo "Copied binary to bin/${CODENAME}.bin"
-
-      - name: Update README.md
-        run: |
-          # FIX: Add the new device to the README supported devices table
-          CODENAME=$(echo "${{ github.event.inputs.product_name }}" | tr '[:upper:]' '[:lower:]' | tr ' -' '__' | tr -d "'." | tr -s '_')
-          PRODUCT_NAME="${{ github.event.inputs.product_name }}"
-          
-          # Find the end of the devices table (line with just |)
-          # Insert the new device row before the empty line after the last device entry
-          if grep -q "The following devices are currently supported:" README.md; then
-              # Add the new device to the table
-              sed -i "/| .*|.*| \`.*\` |$/a | ${PRODUCT_NAME} | \`${CODENAME}\` |" README.md || true
-              
-              # If sed insertion didn't work, use python to insert before the closing line of the table
-              python3 -c "
-          import re
-          with open('README.md', 'r') as f:
-              content = f.read()
-          
-          codename = '${CODENAME}'
-          product_name = '${PRODUCT_NAME}'
-          new_row = f'| {product_name} | \`{codename}\` |'
-          
-          # Check if device already exists in table
-          if codename in content:
-              print(f'Device {codename} already exists in README.md, skipping table update.')
-          else:
-              # Find the table section and insert before the empty separator line
-              lines = content.split('\n')
-              new_lines = []
-              inserted = False
-              for i, line in enumerate(lines):
-                  if not inserted and line.startswith('|') and '|' in line[1:] and (i + 1 < len(lines)) and lines[i+1].strip() == '':
-                      new_lines.append(line)
-                      new_lines.append(new_row)
-                      inserted = True
-                      continue
-                  new_lines.append(line)
-              
-              if not inserted:
-                  # Fallback: insert before the line starting with 'Adding support'
-                  for i, line in enumerate(new_lines):
-                      if line.startswith('Adding support'):
-                          new_lines.insert(i, '')
-                          new_lines.insert(i, new_row)
-                          inserted = True
-                          break
-              
-              if inserted:
-                  with open('README.md', 'w') as f:
-                      f.write('\n'.join(new_lines))
-                  print(f'Added {codename} to README.md')
-              else:
-                  print('Could not find suitable insertion point in README.md')
-          "
-          else
-              echo "Warning: Could not find supported devices section in README.md"
-          fi
-
-      - name: Commit and Push
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add injector/devices.py
-          git add bin/
-          git add README.md
-          git commit -m "feat: Add support for ${{ github.event.inputs.product_name }}"
+          git add bin/${DEVICE_CODE}.bin
+          git commit -m "Add support for ${{ env.DEVICE_NAME }} (${{ env.DEVICE_CODE }})"
           git push
