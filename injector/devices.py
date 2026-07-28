@@ -901,4 +901,21 @@ DEVICES = [
         },
         cert_bypass=CertBypass.WRAP
     ),
+
+Device(
+    'gold',
+    'Xiaomi Redmi Note 13 5G / 13R Pro',
+    {
+        # sec_get_vfy_policy: NOT FOUND - Pattern not found
+        # force_green_state: NOT FOUND - Pattern not found
+        # spoof_sboot_state: NOT FOUND - Pattern not found
+        # spoof_lock_state: NOT FOUND - Pattern not found
+        # dont_relock_seccfg: NOT FOUND - Pattern not found
+        # bypass_security_control: NOT FOUND - Pattern not found
+        # bypass_cmd_erase_lock_control: NOT FOUND - Pattern not found
+        # bypass_cmd_flash_control: NOT FOUND - Pattern not found
+        # sec_otp_ver_get: NOT FOUND - Pattern not found
+    },
+    cert_bypass=CertBypass.WRAP
+),
 ]
